@@ -1,0 +1,204 @@
+name: IDMC Deploy to UAT
+ 
+on:
+
+  workflow_dispatch:
+
+    inputs:
+
+      commit_hash:
+
+        description: "Commit hash to deploy. Leave blank to use the workflow commit."
+
+        required: false
+
+        type: string
+ 
+  push:
+
+    branches:
+
+      - ddmain
+
+    tags:
+
+      - "DeployToUAT*"
+ 
+permissions:
+
+  contents: write
+ 
+env:
+
+  IICS_LOGIN_URL: ${{ vars.IICS_LOGIN_URL }}
+
+  IICS_POD_URL: ${{ vars.IICS_POD_URL }}
+
+  SOURCE_BRANCH: main
+
+  UAT_BRANCH: main-uat
+ 
+jobs:
+
+  fetch-commit-hash:
+
+    name: Resolve commit hash
+
+    runs-on: ubuntu-latest
+ 
+    outputs:
+
+      commit_hash: ${{ steps.resolve.outputs.commit_hash }}
+ 
+    steps:
+
+      - name: Resolve commit hash
+
+        id: resolve
+
+        run: |
+
+          set -euo pipefail
+ 
+          if [ -n "${{ github.event.inputs.commit_hash || '' }}" ]; then
+
+            COMMIT_HASH="${{ github.event.inputs.commit_hash }}"
+
+          else
+
+            COMMIT_HASH="${{ github.sha }}"
+
+          fi
+ 
+          echo "Commit hash selected for deployment: $COMMIT_HASH"
+
+          echo "commit_hash=$COMMIT_HASH" >> "$GITHUB_OUTPUT"
+ 
+  review-deployment:
+
+    name: Review deployment
+
+    runs-on: ubuntu-latest
+
+    needs: fetch-commit-hash
+ 
+    steps:
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+ 
+      - name: Print source reference
+
+        run: |
+
+          echo "GitHub ref: ${{ github.ref }}"
+
+          echo "Commit hash: ${{ needs.fetch-commit-hash.outputs.commit_hash }}"
+ 
+      - name: Install Python requirements
+
+        run: |
+
+          python3 -m pip install --upgrade pip
+
+          pip install -r requirements.txt
+ 
+      - name: Get changed IDMC objects and run validation
+
+        run: |
+
+          python3 ./scripts/infa_get_updates.py
+
+        env:
+
+          IICS_USERNAME: ${{ secrets.IICS_USERNAME }}
+
+          IICS_PASSWORD: ${{ secrets.IICS_PASSWORD }}
+
+          COMMIT_HASH: ${{ needs.fetch-commit-hash.outputs.commit_hash }}
+ 
+  deploy-uat:
+
+    name: Deploy to UAT
+
+    runs-on: ubuntu-latest
+
+    needs:
+
+      - fetch-commit-hash
+
+      - review-deployment
+ 
+    outputs:
+
+      uat_commit_hash: ${{ steps.cherry_pick.outputs.uat_commit_hash }}
+ 
+    steps:
+
+      - name: Checkout repository with full history
+
+        uses: actions/checkout@v4
+
+        with:
+
+          fetch-depth: 0
+
+          token: ${{ secrets.GH_REPO_TOKEN }}
+ 
+      - name: Configure Git user
+
+        run: |
+
+          git config --global user.email "${{ vars.GIT_USER_EMAIL }}"
+
+          git config --global user.name "${{ vars.GIT_USER_NAME }}"
+ 
+      - name: Cherry-pick selected commit to UAT branch
+
+        id: cherry_pick
+
+        run: |
+
+          set -euo pipefail
+ 
+          COMMIT_HASH="${{ needs.fetch-commit-hash.outputs.commit_hash }}"
+ 
+          echo "Deploying commit: $COMMIT_HASH"
+
+          echo "Target UAT branch: $UAT_BRANCH"
+ 
+          git fetch origin "$SOURCE_BRANCH" "$UAT_BRANCH"
+
+          git checkout "$UAT_BRANCH"
+
+          git pull origin "$UAT_BRANCH"
+ 
+          git cherry-pick --strategy=recursive -X theirs "$COMMIT_HASH"
+ 
+          UAT_COMMIT_HASH="$(git log -1 --pretty=format:%H)"
+
+          echo "UAT commit hash after cherry-pick: $UAT_COMMIT_HASH"
+ 
+          git push origin HEAD:"$UAT_BRANCH"
+ 
+          echo "uat_commit_hash=$UAT_COMMIT_HASH" >> "$GITHUB_OUTPUT"
+ 
+      - name: Pull/sync UAT in IDMC and run tests
+
+        run: |
+
+          python3 ./scripts/infa_update_and_test.py
+
+        env:
+
+          UAT_IICS_USERNAME: ${{ secrets.UAT_IICS_USERNAME }}
+
+          UAT_IICS_PASSWORD: ${{ secrets.UAT_IICS_PASSWORD }}
+
+          UAT_COMMIT_HASH: ${{ steps.cherry_pick.outputs.uat_commit_hash }}
+
+          IICS_LOGIN_URL: ${{ vars.IICS_LOGIN_URL }}
+
+          IICS_POD_URL: ${{ vars.IICS_POD_URL }}
+ 
