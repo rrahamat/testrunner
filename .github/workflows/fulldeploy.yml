@@ -1,45 +1,109 @@
-name: IDMC UAT Pull by Commit
+name: IDMC Deploy to UAT
  
 on:
+  push:
+    tags:
+      - "DeployToUAT*"
+ 
   workflow_dispatch:
     inputs:
       commit_hash:
-        description: "Git commit hash to pull into IDMC UAT"
-        required: true
+        description: "Optional commit hash to deploy manually. Leave blank when running from tag."
+        required: false
         type: string
  
 permissions:
-  contents: read
+  contents: write
+ 
+env:
+  UAT_BRANCH: ${{ vars.UAT_BRANCH }}
+  GIT_USER_NAME: ${{ vars.GIT_USER_NAME }}
+  GIT_USER_EMAIL: ${{ vars.GIT_USER_EMAIL }}
  
 jobs:
-  pull-uat:
+  deploy-uat:
+    name: Cherry-pick to UAT branch and pull into IDMC UAT
     runs-on: ubuntu-latest
  
-    env:
-      IDMC_LOGIN_URL: ${{ secrets.IDMC_UAT_LOGIN_URL }}
-      IDMC_USERNAME: ${{ secrets.IDMC_UAT_USERNAME }}
-      IDMC_PASSWORD: ${{ secrets.IDMC_UAT_PASSWORD }}
-      COMMIT_HASH: ${{ github.event.inputs.commit_hash }}
- 
     steps:
-      - name: Login to IDMC UAT
-        id: login
-        run: |
-          set -e
+      - name: Checkout Git repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
  
-          RESPONSE=$(curl -sS -X POST "$IDMC_LOGIN_URL" \
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+ 
+      - name: Configure Git user
+        run: |
+          git config --global user.name "$GIT_USER_NAME"
+          git config --global user.email "$GIT_USER_EMAIL"
+ 
+      - name: Resolve source commit
+        id: source_commit
+        env:
+          INPUT_COMMIT_HASH: ${{ github.event.inputs.commit_hash }}
+        run: |
+          set -euo pipefail
+ 
+          git fetch --all --tags
+ 
+          if [ -n "${INPUT_COMMIT_HASH:-}" ]; then
+            SOURCE_COMMIT="$INPUT_COMMIT_HASH"
+          else
+            SOURCE_COMMIT="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          fi
+ 
+          echo "Source commit to deploy: $SOURCE_COMMIT"
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+ 
+      - name: Cherry-pick source commit to UAT branch
+        id: cherry_pick
+        run: |
+          set -euo pipefail
+ 
+          SOURCE_COMMIT="${{ steps.source_commit.outputs.source_commit }}"
+ 
+          echo "Target UAT branch: $UAT_BRANCH"
+ 
+          git fetch origin "$UAT_BRANCH:$UAT_BRANCH" --force
+          git checkout "$UAT_BRANCH"
+          git pull --ff-only origin "$UAT_BRANCH"
+ 
+          git cherry-pick --strategy=recursive -X theirs "$SOURCE_COMMIT"
+ 
+          UAT_COMMIT_HASH="$(git rev-parse HEAD)"
+          echo "UAT branch commit hash: $UAT_COMMIT_HASH"
+ 
+          git push origin "HEAD:$UAT_BRANCH"
+ 
+          echo "uat_commit_hash=$UAT_COMMIT_HASH" >> "$GITHUB_OUTPUT"
+ 
+      - name: Login to IDMC UAT
+        id: idmc_login
+        env:
+          IDMC_LOGIN_URL: ${{ secrets.IDMC_UAT_LOGIN_URL }}
+          IDMC_USERNAME: ${{ secrets.IDMC_UAT_USERNAME }}
+          IDMC_PASSWORD: ${{ secrets.IDMC_UAT_PASSWORD }}
+        run: |
+          set -euo pipefail
+ 
+          LOGIN_RESPONSE=$(curl -sS -X POST "$IDMC_LOGIN_URL" \
             -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
             -d "{
               \"username\": \"$IDMC_USERNAME\",
               \"password\": \"$IDMC_PASSWORD\"
             }")
  
-          SESSION_ID=$(echo "$RESPONSE" | jq -r '.icSessionId')
-          SERVER_URL=$(echo "$RESPONSE" | jq -r '.serverUrl')
+          SESSION_ID=$(echo "$LOGIN_RESPONSE" | jq -r '.icSessionId // empty')
+          SERVER_URL=$(echo "$LOGIN_RESPONSE" | jq -r '.serverUrl // empty')
  
-          if [ -z "$SESSION_ID" ] || [ "$SESSION_ID" = "null" ]; then
-            echo "IDMC login failed"
-            echo "$RESPONSE"
+          if [ -z "$SESSION_ID" ] || [ -z "$SERVER_URL" ]; then
+            echo "IDMC login failed."
+            echo "$LOGIN_RESPONSE" | jq .
             exit 1
           fi
  
@@ -47,64 +111,69 @@ jobs:
           echo "session_id=$SESSION_ID" >> "$GITHUB_OUTPUT"
           echo "server_url=$SERVER_URL" >> "$GITHUB_OUTPUT"
  
-      - name: Pull commit into IDMC UAT
-        id: pull
+      - name: Pull UAT commit into IDMC UAT
+        id: idmc_pull
         run: |
-          set -e
+          set -euo pipefail
  
-          SERVER_URL="${{ steps.login.outputs.server_url }}"
-          SESSION_ID="${{ steps.login.outputs.session_id }}"
+          SERVER_URL="${{ steps.idmc_login.outputs.server_url }}"
+          SESSION_ID="${{ steps.idmc_login.outputs.session_id }}"
+          UAT_COMMIT_HASH="${{ steps.cherry_pick.outputs.uat_commit_hash }}"
  
-          RESPONSE=$(curl -sS -X POST "$SERVER_URL/public/core/v3/pullByCommitHash" \
+          echo "Deploying UAT commit hash to IDMC UAT: $UAT_COMMIT_HASH"
+ 
+          PULL_RESPONSE=$(curl -sS -X POST "$SERVER_URL/public/core/v3/pullByCommitHash" \
             -H "Content-Type: application/json" \
             -H "Accept: application/json" \
             -H "INFA-SESSION-ID: $SESSION_ID" \
             -d "{
-              \"commitHash\": \"$COMMIT_HASH\"
+              \"commitHash\": \"$UAT_COMMIT_HASH\"
             }")
  
-          echo "$RESPONSE" | jq .
+          echo "$PULL_RESPONSE" | jq .
  
-          ACTION_ID=$(echo "$RESPONSE" | jq -r '.actionId // .pullActionId')
+          ACTION_ID=$(echo "$PULL_RESPONSE" | jq -r '.actionId // .pullActionId // .id // empty')
  
-          if [ -z "$ACTION_ID" ] || [ "$ACTION_ID" = "null" ]; then
-            echo "Pull action ID not returned"
+          if [ -z "$ACTION_ID" ]; then
+            echo "Pull action ID not returned."
             exit 1
           fi
  
           echo "action_id=$ACTION_ID" >> "$GITHUB_OUTPUT"
  
-      - name: Monitor pull status
+      - name: Monitor IDMC pull status
         run: |
-          set -e
+          set -euo pipefail
  
-          SERVER_URL="${{ steps.login.outputs.server_url }}"
-          SESSION_ID="${{ steps.login.outputs.session_id }}"
-          ACTION_ID="${{ steps.pull.outputs.action_id }}"
+          SERVER_URL="${{ steps.idmc_login.outputs.server_url }}"
+          SESSION_ID="${{ steps.idmc_login.outputs.session_id }}"
+          ACTION_ID="${{ steps.idmc_pull.outputs.action_id }}"
  
           for i in {1..30}; do
-            RESPONSE=$(curl -sS -X GET \
+            echo "Checking IDMC pull status. Attempt $i."
+ 
+            STATUS_RESPONSE=$(curl -sS -X GET \
               "$SERVER_URL/public/core/v3/sourceControlAction/$ACTION_ID?expand=objects" \
               -H "Accept: application/json" \
               -H "INFA-SESSION-ID: $SESSION_ID")
  
-            echo "$RESPONSE" | jq .
+            echo "$STATUS_RESPONSE" | jq .
  
-            STATE=$(echo "$RESPONSE" | jq -r '.state // .status.state // .status')
+            STATE=$(echo "$STATUS_RESPONSE" | jq -r '.state // .status.state // .status // empty')
  
             if [[ "$STATE" == "SUCCESS" || "$STATE" == "SUCCESSFUL" || "$STATE" == "COMPLETED" ]]; then
-              echo "IDMC UAT pull completed successfully"
+              echo "IDMC UAT pull completed successfully."
               exit 0
             fi
  
             if [[ "$STATE" == "FAILED" || "$STATE" == "ERROR" || "$STATE" == "CANCELLED" ]]; then
-              echo "IDMC UAT pull failed"
+              echo "IDMC UAT pull failed."
               exit 1
             fi
  
-            echo "Current state: $STATE. Waiting..."
+            echo "Current state: ${STATE:-UNKNOWN}. Waiting..."
             sleep 20
           done
  
-          echo "Timed out waiting for pull completion"
+          echo "Timed out waiting for IDMC UAT pull."
           exit 1
