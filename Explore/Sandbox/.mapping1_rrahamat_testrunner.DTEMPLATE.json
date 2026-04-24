@@ -16,14 +16,14 @@
         "value" : "@1"
       } ],
       "additionalInfo" : {
-        "description" : "",
+        "description" : "something",
         "contentType" : "JSON",
         "documentState" : "VALID"
       }
     }
   },
   "dataFileExtension" : "zip",
-  "updateTime" : "2026-04-24T10:27:48.303Z",
+  "updateTime" : "2026-04-24T10:56:27.757Z",
   "objectRefs" : [ {
     "id" : "aWmMPRdRrR2leVS2jtOQsj",
     "name" : "flatfile_src",
