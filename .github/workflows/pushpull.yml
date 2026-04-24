@@ -1,0 +1,50 @@
+name: Push Dev to UAT
+
+on:
+  push:
+    branches:
+      - dev
+
+jobs:
+  push-to-uat:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout dev branch
+        uses: actions/checkout@v3
+        with:
+          ref: dev
+          fetch-depth: 0  # Fetch full history to allow pushing
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Push dev branch to uat branch
+        run: |
+          git push origin dev:uat --force
+        env:
+          GITHUB_TOKEN: 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
+
+  push-uat-to-idmc:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout uat branch
+        uses: actions/checkout@v3
+        with:
+          ref: uat
+          fetch-depth: 0  # Fetch full history to allow pushing
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Push uat branch to idmc branch
+        run: |
+          git push origin uat:idmc --force
+        env:
+          GITHUB_TOKEN: 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
+          
